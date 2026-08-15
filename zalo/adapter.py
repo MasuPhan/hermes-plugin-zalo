@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -75,6 +76,15 @@ HISTORY_DIR = os.environ.get(
     "ZALO_HISTORY_DIR",
     str(Path.home() / ".hermes" / "zalo-history"),
 )
+PAIRING_FILE = os.environ.get(
+    "ZALO_PAIRING_FILE",
+    str(Path.home() / ".hermes" / "zalo-pairing.json"),
+)
+MEDIA_DIR = os.environ.get(
+    "ZALO_MEDIA_DIR",
+    str(Path.home() / ".hermes" / "zalo-media"),
+)
+MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10MB
 
 # ── Slash commands registry ───────────────────────────────────────
 SLASH_COMMANDS = {
@@ -618,6 +628,64 @@ class _CRMContacts:
 
 
 # ---------------------------------------------------------------------------
+# Pairing store (persistent JSON)
+# ---------------------------------------------------------------------------
+
+
+class _PairingStore:
+    """Persistent pairing approval store (JSON file, atomic write)."""
+
+    def __init__(self, filepath: str = PAIRING_FILE):
+        self._filepath = Path(filepath)
+        self._filepath.parent.mkdir(parents=True, exist_ok=True)
+        self._approvals: Dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self._filepath.exists():
+            self._approvals = {}
+            return
+        try:
+            with open(self._filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._approvals = data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            self._approvals = {}
+
+    def _save(self) -> None:
+        """Atomic write: write temp file then rename."""
+        tmp = self._filepath.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._approvals, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self._filepath)
+
+    def get(self, chat_id: str) -> Optional[dict]:
+        return self._approvals.get(chat_id)
+
+    def set(self, chat_id: str, data: dict) -> None:
+        self._approvals[chat_id] = data
+        self._save()
+
+    def pop(self, chat_id: str) -> Optional[dict]:
+        result = self._approvals.pop(chat_id, None)
+        if result is not None:
+            self._save()
+        return result
+
+    def prune_expired(self) -> None:
+        """Remove expired approvals (expires_at < now)."""
+        now = time.time()
+        changed = False
+        for chat_id in list(self._approvals.keys()):
+            exp = self._approvals[chat_id].get("expires_at", 0)
+            if exp and exp < now:
+                del self._approvals[chat_id]
+                changed = True
+        if changed:
+            self._save()
+
+
+# ---------------------------------------------------------------------------
 # Zalo Adapter
 # ---------------------------------------------------------------------------
 
@@ -668,7 +736,7 @@ class ZaloAdapter(BasePlatformAdapter):
         self._bot_info: Optional[dict] = None
         self._bot_id: str = ""
         self._bot_name: str = ""
-        self._pending_approvals: Dict[str, dict] = {}  # chat_id -> approval info
+        self._pending_approvals = _PairingStore()
 
         # Moderation & group management instances
         self._anti_spam = _AntiSpam()
@@ -702,6 +770,7 @@ class ZaloAdapter(BasePlatformAdapter):
             return False
 
         self._client = _ZaloClient(self.bot_token)
+        self._pending_approvals.prune_expired()
 
         # Verify token
         try:
@@ -904,7 +973,7 @@ class ZaloAdapter(BasePlatformAdapter):
 
         if event_name == "message.image.received":
             message_type = MessageType.IMAGE
-            media_url = message.get("photo", "")
+            media_url = message.get("photo", "") or message.get("photo_url", "")
             if not text and message.get("caption"):
                 text = message["caption"]
         elif event_name == "message.sticker.received":
@@ -1000,27 +1069,30 @@ class ZaloAdapter(BasePlatformAdapter):
         # ── DM handling ─────────────────────────────────────────────────
         # DM pairing approval flow (only for PRIVATE chats)
         if self.dm_policy == "pairing":
-            if chat_id not in self._pending_approvals:
+            if self._pending_approvals.get(chat_id) is None:
                 # First contact — generate pairing code
                 code = str(int(time.time()))[-6:]
-                self._pending_approvals[chat_id] = {
+                self._pending_approvals.set(chat_id, {
                     "code": code,
                     "user_id": user_id,
                     "user_name": user_name,
                     "expires_at": time.time() + 3600,  # 1 hour
-                }
+                    "approved": False,
+                })
                 # Send pairing code
                 await self._send_pairing_code(chat_id, code, user_name)
                 return
 
             # Check if approved or still pending
-            approval = self._pending_approvals[chat_id]
-            if approval.get("code"):
+            approval = self._pending_approvals.get(chat_id) or {}
+            if approval.get("code") and not approval.get("approved"):
                 # Still pending — check if the message is the approval code
                 text = (message.get("text") or "").strip()
                 if text == approval["code"]:
-                    # Approved! Remove pairing code
+                    # Approved! Persist approval state
+                    approval["approved"] = True
                     approval.pop("code", None)
+                    self._pending_approvals.set(chat_id, approval)
                     await self._send_text(chat_id, f"✅ Xác thực thành công! Bạn có thể trò chuyện với bot.")
                     # Fall through to handle this message too (after approval)
                 else:
@@ -1032,7 +1104,7 @@ class ZaloAdapter(BasePlatformAdapter):
 
             # Check if expired
             if approval.get("expires_at", 0) < time.time():
-                self._pending_approvals.pop(chat_id, None)
+                self._pending_approvals.pop(chat_id)
                 return
 
         # Auth check
@@ -1311,6 +1383,40 @@ class ZaloAdapter(BasePlatformAdapter):
             return True
         return user_id in self.allowed_users
 
+    async def _download_media(self, url: str) -> Optional[str]:
+        """Download media from Zalo CDN to a local temp file.
+
+        Zalo CDN URLs are auth-restricted and expire, so we must download
+        immediately. Returns local file path, or None on failure.
+        """
+        if not self._client or not self._client._client:
+            return None
+        try:
+            resp = await self._client._client.get(url)
+            resp.raise_for_status()
+            content = resp.content
+            if not content:
+                return None
+
+            # Detect extension from Content-Type
+            ext = ".jpg"
+            ct = resp.headers.get("Content-Type", "")
+            if "png" in ct:
+                ext = ".png"
+            elif "gif" in ct:
+                ext = ".gif"
+            elif "webp" in ct:
+                ext = ".webp"
+
+            os.makedirs(MEDIA_DIR, exist_ok=True)
+            fd, path = tempfile.mkstemp(prefix="zalo_media_", suffix=ext, dir=MEDIA_DIR)
+            with os.fdopen(fd, "wb") as f:
+                f.write(content[:MAX_MEDIA_BYTES])
+            return path
+        except Exception as e:
+            logger.warning("Zalo: media download failed (%s) — passing URL as fallback", e)
+            return None
+
     async def _dispatch_message(
         self,
         text: str,
@@ -1324,6 +1430,12 @@ class ZaloAdapter(BasePlatformAdapter):
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
             return
+
+        # Download image media immediately (Zalo CDN URLs expire)
+        if message_type == MessageType.IMAGE and media_url:
+            media_path = await self._download_media(media_url)
+            if media_path:
+                media_url = media_path
 
         source = self.build_source(
             chat_id=chat_id,
@@ -1340,6 +1452,15 @@ class ZaloAdapter(BasePlatformAdapter):
             message_id=str(int(time.time() * 1000)),
             timestamp=datetime.now(),
         )
+
+        # Attach media path/URL when the event model supports it
+        if media_url:
+            if hasattr(event, "media_urls"):
+                event.media_urls = [media_url]
+            elif hasattr(event, "media_url"):
+                event.media_url = media_url
+            elif hasattr(event, "media_path"):
+                event.media_path = media_url
 
         await self.handle_message(event)
 
@@ -1359,6 +1480,85 @@ class ZaloAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    def _chunk_text(self, text: str, max_len: int = MAX_MESSAGE_LENGTH) -> List[str]:
+        """Split text into chunks at markdown-safe boundaries.
+
+        Prefer newlines, then spaces, then hard cut. Never split inside a
+        markdown link [text](url) — keep the whole link in one chunk.
+        """
+        if len(text) <= max_len:
+            return [text]
+
+        def _link_span_containing(pos: int) -> Optional[tuple]:
+            """Return (start, end_exclusive) if pos is inside a [text](url) span."""
+            # Scan for markdown links that contain pos
+            i = 0
+            while i < len(text):
+                start = text.find("[", i)
+                if start < 0 or start > pos:
+                    return None
+                mid = text.find("](", start)
+                if mid < 0:
+                    return None
+                end = text.find(")", mid + 2)
+                if end < 0:
+                    return None
+                end_ex = end + 1
+                if start <= pos < end_ex:
+                    return (start, end_ex)
+                i = end_ex
+            return None
+
+        def _safe_cut(candidate: int) -> int:
+            """Move cut before a markdown link if candidate lands inside one."""
+            if candidate <= 0:
+                return max_len
+            span = _link_span_containing(candidate - 1)  # last char kept in chunk
+            if span is None:
+                # Also check if cutting mid-link when candidate == link interior
+                span = _link_span_containing(candidate)
+            if span is None:
+                return candidate
+            start, end_ex = span
+            # Candidate splits the link — cut before it if possible
+            if start < candidate < end_ex:
+                if start > 0 and (end_ex - start) <= max_len:
+                    return start
+                # Link itself longer than max_len: unavoidable hard cut
+                return candidate
+            return candidate
+
+        chunks: List[str] = []
+        while len(text) > max_len:
+            # 1. Newline boundary within max_len
+            nl = text.rfind("\n", 0, max_len)
+            if nl > max_len * 0.5:
+                cut = _safe_cut(nl + 1)
+            else:
+                # 2. Space boundary
+                sp = text.rfind(" ", 0, max_len)
+                if sp > max_len * 0.5:
+                    cut = _safe_cut(sp + 1)
+                else:
+                    # 3. Hard cut, still avoid mid-link when possible
+                    cut = _safe_cut(max_len)
+            if cut <= 0:
+                cut = max_len
+            # Prevent infinite loop if safe_cut collapses to 0 somehow
+            if cut <= 0 or (cut >= len(text) and len(text) > max_len):
+                cut = max_len
+            chunk = text[:cut].strip()
+            if chunk:
+                chunks.append(chunk)
+            text = text[cut:].lstrip() if cut < len(text) else ""
+            # If strip emptied progress (all whitespace), force advance
+            if not chunk and text:
+                chunks.append(text[:max_len])
+                text = text[max_len:]
+        if text:
+            chunks.append(text)
+        return chunks
+
     async def send(
         self,
         chat_id: str,
@@ -1373,8 +1573,8 @@ class ZaloAdapter(BasePlatformAdapter):
         # Strip markdown that Zalo doesn't support (keep bold/italic)
         content = self._strip_markdown(content)
 
-        # Split into chunks if too long
-        chunks = [content[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(content), MAX_MESSAGE_LENGTH)]
+        # Split into chunks at markdown-safe boundaries
+        chunks = self._chunk_text(content, MAX_MESSAGE_LENGTH)
 
         last_result = None
         for chunk in chunks:
