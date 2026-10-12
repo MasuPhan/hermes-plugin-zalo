@@ -7,7 +7,7 @@ history sync). This root ``__init__.py`` re-exports the
 plugin entry point so the gateway can discover and load it.
 """
 
-__version__ = "2.1.3"
+__version__ = "2.2.0"
 
 from .zalo.adapter import register
 

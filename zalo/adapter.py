@@ -270,17 +270,30 @@ class _ZaloClient:
             return [raw]
         return []
 
-    async def send_message(self, chat_id: str, text: str) -> dict:
-        """Send a text message (max 2000 chars)."""
+    async def send_message(self, chat_id: str, text: str, parse_mode: Optional[str] = None) -> dict:
+        """Send a text message (max 2000 chars).
+
+        When ``parse_mode`` ("markdown" or "html") is set, the Zalo server
+        parses the markup in ``text`` and strips it from the displayed
+        content, applying native rich-text styles. See
+        https://docs.zaloplatforms.com/docs/BOT/apis/sendMessage.
+        We never send ``text_styles`` alongside it — if both are present the
+        server prefers ``parse_mode`` and ignores ``text_styles``.
+        """
         # Truncate if too long
         text = text[:MAX_MESSAGE_LENGTH]
-        return await self._post("sendMessage", {"chat_id": chat_id, "text": text})
+        payload = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        return await self._post("sendMessage", payload)
 
-    async def send_photo(self, chat_id: str, photo_url: str, caption: str = "") -> dict:
+    async def send_photo(self, chat_id: str, photo_url: str, caption: str = "", parse_mode: Optional[str] = None) -> dict:
         """Send a photo from a URL."""
         payload = {"chat_id": chat_id, "photo": photo_url}
         if caption:
             payload["caption"] = caption[:MAX_MESSAGE_LENGTH]
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
         return await self._post("sendPhoto", payload)
 
     async def send_chat_action(self, chat_id: str, action: str = "typing") -> dict:
@@ -1447,20 +1460,28 @@ class ZaloAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        """Send a text message to a Zalo chat (chunked at 2000 chars)."""
+        """Send a text message to a Zalo chat (chunked at 2000 chars).
+
+        Content is transformed by ``_prepare_for_zalo`` and sent with
+        ``parse_mode="markdown"`` so Zalo renders bold/italic/strike,
+        headings, lists and blockquotes natively (the server strips the
+        markup itself). Constructs Zalo does NOT render (pipe tables,
+        task-list checkboxes, ``<details>``, ``$$math$$``) are converted to
+        plain text beforehand.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        # Strip markdown that Zalo doesn't support (keep bold/italic)
-        content = self._strip_markdown(content)
+        prepared = self._prepare_for_zalo(content)
+        if not prepared:
+            return SendResult(success=False, error="Empty message after formatting")
 
-        # Split into chunks if too long
-        chunks = [content[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(content), MAX_MESSAGE_LENGTH)]
+        chunks = self._split_chunks(prepared)
 
         last_result = None
         for chunk in chunks:
             try:
-                result = await self._client.send_message(chat_id, chunk)
+                result = await self._client.send_message(chat_id, chunk, parse_mode="markdown")
                 last_result = result
                 await asyncio.sleep(0.3)
             except Exception as e:
@@ -1481,11 +1502,17 @@ class ZaloAdapter(BasePlatformAdapter):
             pass
 
     async def send_image(self, chat_id: str, image_url: str, caption: str = "") -> SendResult:
-        """Send an image message."""
+        """Send an image message (caption rendered via parse_mode markdown)."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
-            result = await self._client.send_photo(chat_id, image_url, caption)
+            prepared_caption = self._prepare_for_zalo(caption) if caption else ""
+            result = await self._client.send_photo(
+                chat_id,
+                image_url,
+                prepared_caption,
+                parse_mode="markdown" if prepared_caption else None,
+            )
             if result.get("ok"):
                 msg_id = result.get("result", {}).get("message_id", "")
                 return SendResult(success=True, message_id=msg_id)
@@ -1500,52 +1527,164 @@ class ZaloAdapter(BasePlatformAdapter):
             "type": "dm",
         }
 
-    # ── Helpers ───────────────────────────────────────────────────────────
+    # ── Rich-text formatting for parse_mode=markdown ──────────────────────
+
+    # Spans that Zalo's server-side markdown parser renders natively and
+    # that our stray-marker cleanup must never touch.
+    _KEEP_SPAN_RE = re.compile(r"(\*\*\*.+?\*\*\*|\*\*.+?\*\*|~~.+?~~|`[^`\n]+`)")
 
     @staticmethod
-    def _strip_markdown(text: str) -> str:
-        """Strip markdown formatting to plain text for Zalo.
+    def _prepare_for_zalo(text: str) -> str:
+        """Transform agent markdown into the subset Zalo renders with parse_mode="markdown".
 
-        Zalo does NOT reliably render markdown, so keep chat replies plain:
-        remove bold, italic, headings, lists, inline code, tables, blockquotes,
-        links and images so no raw ``*``, ``#``, ``-``, ``|``, ``>``, `` ` `` or
-        ``~`` leaks to the customer.
+        Zalo's sendMessage accepts ``parse_mode: "markdown"`` — the server
+        parses the markup, strips it from the displayed text, and applies the
+        style (live-verified 2026-10-12, https://docs.zaloplatforms.com/docs/BOT/apis/sendMessage).
+
+        PRESERVED (rendered natively): ``**bold**``/``__bold__``,
+        ``*italic*``/``_italic_``, ``***bold italic***``, ``~~strike~~``,
+        inline `` `code` `` (kept literal), ``#``–``####`` headings,
+        ``-``/``*``/``+`` bullets, ``1.`` ordered lists, ``>`` blockquotes,
+        indentation, ``{red}``-style color tags, ``{big}``, ``{underline}``.
+
+        CONVERTED TO PLAIN (accepted by the API but NOT rendered — verified
+        by operator screenshot 2026-10-12: raw markup leaks to the client):
+        pipe tables (rows joined with " — "), GFM task-list checkboxes
+        (``- [ ] x`` -> ``- x``), ``<details>``/``<summary>`` tags (inner
+        text kept), ``$$math$$`` / ``\\[..\\]`` (delimiters stripped,
+        expression text kept), ``#####``+ deep headings (-> bold).
+
+        Links/images keep the old plain conversion: ``[t](u)`` -> ``t (u)``,
+        ``![a](u)`` -> ``u``. Stray ``*``/``_`` runs of 3+ outside a matched
+        emphasis pair are removed so unpaired dividers don't leak raw markup
+        now that markers are no longer blanket-stripped.
+
+        NEVER leaves raw ``|`` table rows, ``$$``, ``<details>`` or ``[ ]``
+        checkboxes in the output.
         """
-        import re
-        # Images: ![alt](url) -> url
+        # Images: ![alt](url) -> url (before any emphasis handling so URLs
+        # with _ or - are not mis-parsed).
         text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\2", text)
         # Links: [text](url) -> text (url)
         text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
-        # Inline code: `code` -> code
-        text = re.sub(r"`([^`]*)`", r"\1", text)
-        # Bold: **text** / __text__ -> text
-        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-        text = re.sub(r"__(.+?)__", r"\1", text)
-        # Italic: *text* / _text_ -> text
-        text = re.sub(r"(?<![\w*])\*([^*\n]+?)\*(?![\w*])", r"\1", text)
-        text = re.sub(r"(?<![\w_])\_([^_\n]+?)\_(?![\w_])", r"\1", text)
-        # Strikethrough: ~~text~~ -> text
-        text = re.sub(r"~~(.+?)~~", r"\1", text)
-        # Headings: strip leading #s, keep the text
-        text = re.sub(r"^#{1,6}[ \t]*", "", text, flags=re.MULTILINE)
-        # Blockquote: strip leading >
-        text = re.sub(r"^[ \t]*>[ \t]?", "", text, flags=re.MULTILINE)
-        # Ordered/unordered list markers: strip, keep the text
-        text = re.sub(r"^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)", "", text, flags=re.MULTILINE)
-        # Table separator rows: drop the whole line
+        # <details>/<summary> (optionally with attributes): drop the tags,
+        # keep the inner text — Zalo renders the raw tags as literal text.
+        text = re.sub(r"</?(?:details|summary)\b[^>]*>", "", text, flags=re.IGNORECASE)
+        # Math: $$..$$ and \[..] -> keep the expression, strip delimiters.
+        text = re.sub(r"\$\$(.+?)\$\$", r"\1", text, flags=re.DOTALL)
+        text = re.sub(r"\\\[([\s\S]+?)\\\]", r"\1", text)
+        # GFM task lists: "- [ ] x" / "* [x] x" / "1. [x] x" -> "- x" —
+        # the checkbox brackets otherwise show as raw text.
+        text = re.sub(
+            r"^([ \t]*(?:[-*+]|\d+[.)])[ \t]+)\[[ xXXx]\][ \t]+",
+            r"\1",
+            text,
+            flags=re.MULTILINE,
+        )
+        # Headings deeper than #### (Zalo documents up to h4, and requires
+        # space+content after the marker) -> bold text. Handles no-space
+        # forms like "#####Tiêu đề" so the raw run can never leak.
+        text = re.sub(r"^#{5,}[ \t]*(.+?)[ \t]*$", r"**\1**", text, flags=re.MULTILINE)
+        # Tables: drop separator rows (|---|---|), then join data rows into
+        # "cell — cell" lines (same conversion the old stripper used).
         text = re.sub(r"^[ \t]*\|[\s:|-]+\|[ \t]*$", "", text, flags=re.MULTILINE)
-        text = re.sub(r"^[ \t]*-{3,}[ \t]*$", "", text, flags=re.MULTILINE)
-        # Table data rows -> plain per-line, cells joined with an em-dash
+
         def _fmt_table(m):
             inner = m.group(0).strip().strip("|")
             cells = [c.strip() for c in inner.split("|") if c.strip()]
             return " — ".join(cells)
+
         text = re.sub(r"^[ \t]*\|.*\|[ \t]*$", _fmt_table, text, flags=re.MULTILINE)
-        # Remove any stray emphasis markers left behind
-        text = re.sub(r"[*~]", "", text)
-        # Collapse 3+ blank lines to a single blank line, trim edges
+        # Horizontal-rule-only lines (---, ***, ___, and spaced variants like
+        # "* * *"): Zalo renders them literally, so swap in a plain divider.
+        text = re.sub(
+            r"^[ \t]*(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$",
+            "———", text, flags=re.MULTILINE,
+        )
+        # Plus runs: `+` is a Zalo bullet marker only as "+ <content>".
+        # A line of 3+ pluses ("++++++", "+ + +") is junk -> plain divider.
+        text = re.sub(r"^[ \t]*(?:\+[ \t]*){3,}[ \t]*$", "———", text, flags=re.MULTILINE)
+        # "++ item"/"+++item" (run of pluses before content) is not a valid
+        # marker -> collapse to a single "+ " bullet.
+        text = re.sub(r"^([ \t]*)\+{2,}[ \t]*(\S.*)$", r"\1+ \2", text, flags=re.MULTILINE)
+        # Stray emphasis cleanup: collapse runs of 3+ * or _ that sit OUTSIDE
+        # a matched bold/strike/code span (those spans are kept intact), plus
+        # empty ~~ pairs ("~~~~") and bare 3+ | runs the table pass missed.
+        # Single/double markers outside pairs are left alone — conservative,
+        # per spec; over-eager stripping mangles legit emphasis. Load-bearing:
+        # customers used to SEE "++++++" / "****" / "#####" raw in chat, so
+        # no marker run may ever reach the client as literal characters.
+        parts = ZaloAdapter._KEEP_SPAN_RE.split(text)
+        for i in range(0, len(parts), 2):  # even indices = unprotected text
+            parts[i] = re.sub(r"[*_]{3,}", "", parts[i])
+            parts[i] = re.sub(r"~{2,}", "", parts[i])
+            parts[i] = re.sub(r"\|{3,}", "", parts[i])
+            # 3+ pluses are never a valid "+ <content>" bullet anywhere in a
+            # line, and 5+ hashes exceed the documented #..#### heading
+            # range — drop both so no raw run can ever reach the client.
+            parts[i] = re.sub(r"\+{3,}", "", parts[i])
+            parts[i] = re.sub(r"#{5,}", "", parts[i])
+        text = "".join(parts)
+        # Collapse 3+ blank lines to a single blank line, trim edges.
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
+
+    @staticmethod
+    def _split_chunks(text: str) -> List[str]:
+        """Split prepared text into <=2000-char chunks on paragraph boundaries.
+
+        Splits greedily at blank-line paragraph boundaries, then at line
+        boundaries, so a ``**bold**`` span is never cut mid-token — except in
+        the degenerate case of a single unbreakable line longer than the cap,
+        where we fall back to the nearest whitespace. (Zalo has no message
+        threading, so emphasis must always close inside one chunk.)
+        """
+        cap = MAX_MESSAGE_LENGTH
+        if len(text) <= cap:
+            return [text]
+
+        def _hard_split(line: str) -> List[str]:
+            """Last resort for one over-long line: cut at the nearest space."""
+            out: List[str] = []
+            while len(line) > cap:
+                cut = line.rfind(" ", 0, cap)
+                if cut <= 0:
+                    cut = cap  # no whitespace: unavoidable mid-token cut
+                out.append(line[:cut].rstrip())
+                line = line[cut:].lstrip()
+            if line:
+                out.append(line)
+            return out
+
+        chunks: List[str] = []
+        current = ""
+        for para in re.split(r"\n\s*\n", text):
+            para = para.strip("\n")
+            if not para:
+                continue
+            candidate = f"{current}\n\n{para}" if current else para
+            if len(candidate) <= cap:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+                current = ""
+            # Paragraph doesn't fit alone: pack its lines, split long lines.
+            for piece in para.split("\n"):
+                if len(piece) > cap:
+                    if current:
+                        chunks.append(current)
+                        current = ""
+                    chunks.extend(_hard_split(piece))
+                    continue
+                if current and len(current) + len(piece) + 1 > cap:
+                    chunks.append(current)
+                    current = piece
+                else:
+                    current = f"{current}\n{piece}" if current else piece
+        if current:
+            chunks.append(current)
+        return [c for c in chunks if c.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -1781,8 +1920,10 @@ def register(ctx):
         pii_safe=False,
         allow_update_command=True,
         platform_hint=(
-            "You are chatting via Zalo. Zalo supports limited formatting "
-            "— **bold** and *italic* work, but complex markdown is stripped. "
+            "You are chatting via Zalo. Zalo renders markdown natively: "
+            "bold, italic, strikethrough, headings, lists, blockquotes, "
+            "inline code. Tables, task lists, and math are NOT supported — "
+            "convert tables to plain lines before answering. "
             "Messages are limited to 2000 characters per message "
             "(long messages are automatically split). "
             "Keep responses concise and conversational. "
