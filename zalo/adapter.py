@@ -1569,7 +1569,10 @@ class ZaloAdapter(BasePlatformAdapter):
         text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
         # <details>/<summary> (optionally with attributes): drop the tags,
         # keep the inner text — Zalo renders the raw tags as literal text.
-        text = re.sub(r"</?(?:details|summary)\b[^>]*>", "", text, flags=re.IGNORECASE)
+        # Replace with "\n", not "": stripping to nothing glues the summary
+        # label to the body ("Bỏ quaNội dung ẩn"). The blank-line collapse at
+        # the end of this function squashes any excess newlines. (t_ded994c7)
+        text = re.sub(r"</?(?:details|summary)\b[^>]*>", "\n", text, flags=re.IGNORECASE)
         # Math: $$..$$ and \[..] -> keep the expression, strip delimiters.
         text = re.sub(r"\$\$(.+?)\$\$", r"\1", text, flags=re.DOTALL)
         text = re.sub(r"\\\[([\s\S]+?)\\\]", r"\1", text)
@@ -1614,6 +1617,20 @@ class ZaloAdapter(BasePlatformAdapter):
         # per spec; over-eager stripping mangles legit emphasis. Load-bearing:
         # customers used to SEE "++++++" / "****" / "#####" raw in chat, so
         # no marker run may ever reach the client as literal characters.
+        # Stray marker normalization (t_ded994c7 FIX-2): Zalo renders only
+        # 2-star bold, 3-star bold-italic and 2-tilde strike; any run of 4+
+        # '*' or 3+ '~' is malformed and must never reach the client. Such
+        # runs are replaced by a sentinel BEFORE the protected-span split —
+        # _KEEP_SPAN_RE otherwise matches only *part* of the run (e.g.
+        # '****bold****' -> keeps '****bold**') and the leftover escapes
+        # cleanup. Sentinels are stripped at the end, leaving clean text.
+        # Runs inside `code` spans are masked out first so raw content like
+        # `code **** raw` stays verbatim.
+        code_parts = re.split(r"(`[^`\n]+`)", text)
+        for i in range(0, len(code_parts), 2):  # even = outside code spans
+            code_parts[i] = re.sub(r"\*{4,}", "\x01", code_parts[i])
+            code_parts[i] = re.sub(r"~{3,}", "\x02", code_parts[i])
+        text = "".join(code_parts)
         parts = ZaloAdapter._KEEP_SPAN_RE.split(text)
         for i in range(0, len(parts), 2):  # even indices = unprotected text
             parts[i] = re.sub(r"[*_]{3,}", "", parts[i])
@@ -1625,19 +1642,93 @@ class ZaloAdapter(BasePlatformAdapter):
             parts[i] = re.sub(r"\+{3,}", "", parts[i])
             parts[i] = re.sub(r"#{5,}", "", parts[i])
         text = "".join(parts)
+        # Drop the FIX-2 sentinels (malformed 4+ '*' / 3+ '~' runs).
+        text = text.replace("\x01", "").replace("\x02", "")
         # Collapse 3+ blank lines to a single blank line, trim edges.
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
+
+    @staticmethod
+    def _rebalance_bold_spans(chunks: List[str]) -> List[str]:
+        """Ensure no chunk carries an odd number of ``**`` markers.
+
+        A bold span can straddle a chunk boundary (multi-line span split at a
+        line edge, hard-split of an over-long line): Zalo has no message
+        threading, and a lone ``**`` renders as literal markup to the client.
+        Close the stray span at the end of the chunk (``...text**``) and
+        reopen it at the start of the next (``**text...``), shifting trailing
+        tokens/characters into the next chunk when needed so both chunks stay
+        within MAX_MESSAGE_LENGTH. (t_ded994c7 FIX-3)
+        """
+        if len(chunks) < 2:
+            return chunks
+        cap = MAX_MESSAGE_LENGTH
+        for _round in range(10):  # fixed-point guard; normally 1 pass
+            dirty = False
+            # a) any chunk that grew past the cap (reopen markers, token
+            #    pushes) gets re-split at whitespace, then re-balanced below.
+            for j in range(len(chunks)):
+                if len(chunks[j]) > cap:
+                    chunks[j:j + 1] = ZaloAdapter._hard_split_chunk(chunks[j])
+                    dirty = True
+            # b) close stray bold spans at boundaries.
+            for j in range(len(chunks) - 1):
+                if chunks[j].count("**") % 2 == 0:
+                    continue
+                while len(chunks[j]) + 2 > cap:
+                    # make room: push the trailing whitespace token, or a
+                    # single char if the chunk is unbreakable.
+                    head, sep, moved = chunks[j].rpartition(" ")
+                    if sep:
+                        chunks[j] = head
+                        chunks[j + 1] = moved + " " + chunks[j + 1]
+                    else:
+                        chunks[j + 1] = chunks[j][-1] + chunks[j + 1]
+                        chunks[j] = chunks[j][:-1]
+                    dirty = True
+                chunks[j] += "**"
+                chunks[j + 1] = "**" + chunks[j + 1]
+                dirty = True
+            if chunks[-1].count("**") % 2 and len(chunks[-1]) + 2 <= cap:
+                # Total '**' count odd = unclosed stray span in the source;
+                # close it so the lone '**' does not render raw.
+                chunks[-1] += "**"
+                dirty = True
+            stray = [j for j, c in enumerate(chunks) if c.count("**") % 2]
+            over = [c for c in chunks if len(c) > cap]
+            if not stray and not over:
+                return [c for c in chunks if c.strip()]
+            if not dirty:
+                break
+        return [c for c in chunks if c.strip()]
+
+    @staticmethod
+    def _hard_split_chunk(line: str) -> List[str]:
+        """Split one over-cap chunk at the nearest space (whitespace-free
+        chunks fall back to a mid-token cut)."""
+        cap = MAX_MESSAGE_LENGTH
+        out: List[str] = []
+        while len(line) > cap:
+            cut = line.rfind(" ", 0, cap)
+            if cut <= 0:
+                cut = cap  # no whitespace: unavoidable mid-token cut
+            out.append(line[:cut].rstrip())
+            line = line[cut:].lstrip()
+        if line:
+            out.append(line)
+        return out
 
     @staticmethod
     def _split_chunks(text: str) -> List[str]:
         """Split prepared text into <=2000-char chunks on paragraph boundaries.
 
         Splits greedily at blank-line paragraph boundaries, then at line
-        boundaries, so a ``**bold**`` span is never cut mid-token — except in
-        the degenerate case of a single unbreakable line longer than the cap,
-        where we fall back to the nearest whitespace. (Zalo has no message
-        threading, so emphasis must always close inside one chunk.)
+        boundaries. A ``**bold**`` span can still straddle a boundary (a
+        multi-line span cut between its lines, or a hard split of one
+        over-long line); because Zalo has no message threading,
+        ``_rebalance_bold_spans`` then closes the span at the end of one
+        chunk and reopens it at the start of the next, so every chunk keeps an
+        even ``**`` count and stays within the cap. (t_ded994c7 FIX-3)
         """
         cap = MAX_MESSAGE_LENGTH
         if len(text) <= cap:
@@ -1684,7 +1775,7 @@ class ZaloAdapter(BasePlatformAdapter):
                     current = f"{current}\n{piece}" if current else piece
         if current:
             chunks.append(current)
-        return [c for c in chunks if c.strip()]
+        return ZaloAdapter._rebalance_bold_spans([c for c in chunks if c.strip()])
 
 
 # ---------------------------------------------------------------------------
