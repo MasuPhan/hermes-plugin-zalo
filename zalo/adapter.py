@@ -1650,73 +1650,74 @@ class ZaloAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _rebalance_bold_spans(chunks: List[str]) -> List[str]:
-        """Ensure no chunk carries an odd number of ``**`` markers.
+        """Drop stray ``**``/``***`` bold markers that cannot close inside
+        their own chunk, so every chunk satisfies the send-time invariants:
+        ``len <= MAX_MESSAGE_LENGTH``, an even ``**`` count, and no raw 3+
+        star run outside the constructs ``_prepare_for_zalo`` protects.
 
-        A bold span can straddle a chunk boundary (multi-line span split at a
-        line edge, hard-split of an over-long line): Zalo has no message
-        threading, and a lone ``**`` renders as literal markup to the client.
-        Close the stray span at the end of the chunk (``...text**``) and
-        reopen it at the start of the next (``**text...``), shifting trailing
-        tokens/characters into the next chunk when needed so both chunks stay
-        within MAX_MESSAGE_LENGTH. (t_ded994c7 FIX-3)
+        A bold span can straddle a chunk boundary (a multi-line span cut
+        between its lines, or a hard split of an over-long line). v2.2.1
+        tried to *insert* a closing ``**`` at the end of the straddling
+        chunk and reopen the span at the start of the next; review
+        t_bbb53fdf round 2 proved that blind insertion (a) fuses with
+        markers already adjacent to the boundary into raw ``****`` /
+        ``*****`` runs shipped to the client — the exact garbage class this
+        plugin exists to eliminate — (b) could push a chunk past the 2000
+        cap, and (c) cascades: one stray marker re-opens a span that every
+        following chunk inherits, bolding half a 13k-char message.
+
+        v2.2.2 (t_155aaa0d FIX-3a/3b/3c, reviewer-recommended option 1)
+        instead DROPS the stray marker ("stray → plain"). An unclosed span
+        renders literally on Zalo anyway, so dropping it is a visual no-op.
+
+        Implementation: per chunk, loop on masked views of the raw string
+        that preserve length (code spans — and, for the run check, completed
+        ``***bold-italic***`` spans, the two constructs ``_prepare_for_zalo``
+        is approved to preserve verbatim — are replaced by equal-length
+        spaces), so offsets map 1:1 back onto ``raw`` and no character ever
+        moves. Each iteration either (1) finds an odd number of
+        non-overlapping ``**`` pairs in the code-masked view — the last pair
+        has no closer, its span cannot close inside this message, so delete
+        it — or (2) deletes every 3+ star run visible outside the masked
+        constructs, then re-enters to re-verify parity (a run of 3 stars
+        pairs as ``**`` + stray ``*``, so scrubbing can flip parity; the
+        loop absorbs that). Deletions only shrink the chunk (cap holds),
+        touch no sibling (no cascade). Every iteration removes ≥1 character,
+        so the loop terminates by construction — no round budget, no
+        fail-open bailout — and the exit state is exactly the invariant:
+        even ``**`` pairs and no ``\\*{3,}`` run in the visible text.
+        (Single-marker ``*italic*``, code spans, and completed BI spans are
+        never altered.)
         """
-        if len(chunks) < 2:
-            return chunks
-        cap = MAX_MESSAGE_LENGTH
-        for _round in range(10):  # fixed-point guard; normally 1 pass
-            dirty = False
-            # a) any chunk that grew past the cap (reopen markers, token
-            #    pushes) gets re-split at whitespace, then re-balanced below.
-            for j in range(len(chunks)):
-                if len(chunks[j]) > cap:
-                    chunks[j:j + 1] = ZaloAdapter._hard_split_chunk(chunks[j])
-                    dirty = True
-            # b) close stray bold spans at boundaries.
-            for j in range(len(chunks) - 1):
-                if chunks[j].count("**") % 2 == 0:
-                    continue
-                while len(chunks[j]) + 2 > cap:
-                    # make room: push the trailing whitespace token, or a
-                    # single char if the chunk is unbreakable.
-                    head, sep, moved = chunks[j].rpartition(" ")
-                    if sep:
-                        chunks[j] = head
-                        chunks[j + 1] = moved + " " + chunks[j + 1]
-                    else:
-                        chunks[j + 1] = chunks[j][-1] + chunks[j + 1]
-                        chunks[j] = chunks[j][:-1]
-                    dirty = True
-                chunks[j] += "**"
-                chunks[j + 1] = "**" + chunks[j + 1]
-                dirty = True
-            if chunks[-1].count("**") % 2 and len(chunks[-1]) + 2 <= cap:
-                # Total '**' count odd = unclosed stray span in the source;
-                # close it so the lone '**' does not render raw.
-                chunks[-1] += "**"
-                dirty = True
-            stray = [j for j, c in enumerate(chunks) if c.count("**") % 2]
-            over = [c for c in chunks if len(c) > cap]
-            if not stray and not over:
-                return [c for c in chunks if c.strip()]
-            if not dirty:
-                break
-        return [c for c in chunks if c.strip()]
+        code_span = re.compile(r"`[^`\n]+`")
+        bi_span = re.compile(r"\*\*\*.+?\*\*\*")
 
-    @staticmethod
-    def _hard_split_chunk(line: str) -> List[str]:
-        """Split one over-cap chunk at the nearest space (whitespace-free
-        chunks fall back to a mid-token cut)."""
-        cap = MAX_MESSAGE_LENGTH
+        def _mask(text: str, pat: re.Pattern) -> str:
+            return pat.sub(lambda mm: " " * len(mm.group(0)), text)
+
         out: List[str] = []
-        while len(line) > cap:
-            cut = line.rfind(" ", 0, cap)
-            if cut <= 0:
-                cut = cap  # no whitespace: unavoidable mid-token cut
-            out.append(line[:cut].rstrip())
-            line = line[cut:].lstrip()
-        if line:
-            out.append(line)
-        return out
+        for raw in chunks:
+            while True:
+                vis = _mask(raw, code_span)  # code spans → spaces, 1:1
+                # Greedy non-overlapping '**' pairing (str.count semantics).
+                last_pair = -1
+                n_pairs = 0
+                i = vis.find("**")
+                while i >= 0:
+                    n_pairs += 1
+                    last_pair = i
+                    i = vis.find("**", i + 2)
+                if n_pairs % 2:
+                    raw = raw[:last_pair] + raw[last_pair + 2:]
+                    continue
+                w = _mask(vis, bi_span)  # completed BI spans → spaces
+                runs = [mm.span() for mm in re.finditer(r"\*{3,}", w)]
+                if not runs:
+                    break
+                for a, b in reversed(runs):
+                    raw = raw[:a] + raw[b:]
+            out.append(raw)
+        return [x for x in out if x.strip()]
 
     @staticmethod
     def _split_chunks(text: str) -> List[str]:
@@ -1724,15 +1725,18 @@ class ZaloAdapter(BasePlatformAdapter):
 
         Splits greedily at blank-line paragraph boundaries, then at line
         boundaries. A ``**bold**`` span can still straddle a boundary (a
-        multi-line span cut between its lines, or a hard split of one
-        over-long line); because Zalo has no message threading,
-        ``_rebalance_bold_spans`` then closes the span at the end of one
-        chunk and reopens it at the start of the next, so every chunk keeps an
-        even ``**`` count and stays within the cap. (t_ded994c7 FIX-3)
+        multi-line span cut between its lines, or a hard split of an
+        over-long line); ``_rebalance_bold_spans`` then drops the stray
+        marker so every chunk handed to the API satisfies the send-time
+        invariants (cap, even ``**``, no raw star run). Single-chunk
+        messages route through the same rebalancer — the invariants gate
+        EVERY payload, not only split ones (v2.2.2; a stray/unclosed
+        construct in a short message would otherwise ship raw).
+        (t_ded994c7 FIX-3, t_155aaa0d v2.2.2)
         """
         cap = MAX_MESSAGE_LENGTH
         if len(text) <= cap:
-            return [text]
+            return ZaloAdapter._rebalance_bold_spans([text])
 
         def _hard_split(line: str) -> List[str]:
             """Last resort for one over-long line: cut at the nearest space."""
