@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Minimal gate: this plugin ships no pyproject on main (intentionally removed
+# in v2.1.3 so `pip install` never leaks a top-level `zalo` package into the
+# shared Hermes env), so "build" = byte-compile + manifest validation +
+# import smoke with host modules stubbed. No secrets required.
+
+permissions:
+  contents: read
+
+jobs:
+  build-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pip install --quiet uv
+
+      - name: Byte-compile (build check)
+        run: uv run --no-project --python 3.11 python -m compileall -q zalo __init__.py
+
+      - name: Validate plugin.yaml
+        run: >
+          uv run --no-project --python 3.11 --with pyyaml
+          python -c "import yaml,pathlib;
+          d=yaml.safe_load(pathlib.Path('plugin.yaml').read_text());
+          assert d['name']=='zalo-platform' and d['version'], d;
+          print('plugin.yaml OK:', d['name'], d['version'])"
+
+      - name: Import smoke (host modules stubbed)
+        run: uv run --no-project --python 3.11 python .github/ci/import_smoke.py
