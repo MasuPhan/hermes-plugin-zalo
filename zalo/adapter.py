@@ -1071,7 +1071,7 @@ class ZaloAdapter(BasePlatformAdapter):
         text = raw_text
 
         if event_name == "message.image.received":
-            message_type = MessageType.IMAGE
+            message_type = getattr(MessageType, "PHOTO", getattr(MessageType, "IMAGE", MessageType.TEXT))
             media_url = message.get("photo", "")
             if not text and message.get("caption"):
                 text = message["caption"]
@@ -1548,7 +1548,8 @@ class ZaloAdapter(BasePlatformAdapter):
             return
 
         # Download image media immediately (Zalo CDN URLs expire)
-        if message_type == MessageType.IMAGE and media_url:
+        photo_type = getattr(MessageType, "PHOTO", getattr(MessageType, "IMAGE", None))
+        if photo_type and message_type == photo_type and media_url:
             media_path = await self._download_media(media_url)
             if media_path:
                 media_url = media_path
