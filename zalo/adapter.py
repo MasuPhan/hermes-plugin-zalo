@@ -975,6 +975,7 @@ class ZaloAdapter(BasePlatformAdapter):
                     continue
 
                 consecutive_errors = 0
+                logger.info("Zalo: poll received %d update(s)", len(updates))
 
                 for update in updates:
                     event_name = update.get("event_name", "")
@@ -982,6 +983,14 @@ class ZaloAdapter(BasePlatformAdapter):
 
                     if not message:
                         continue
+
+                    logger.info(
+                        "Zalo: incoming event '%s' from %s (%s): %s",
+                        event_name,
+                        message.get("from", {}).get("display_name"),
+                        message.get("from", {}).get("id"),
+                        (message.get("text") or message.get("caption") or "")[:50],
+                    )
 
                     await self._handle_incoming(event_name, message)
 
@@ -1593,6 +1602,15 @@ class ZaloAdapter(BasePlatformAdapter):
             timestamp=datetime.now(),
         )
 
+        logger.info(
+            "Zalo: dispatching to agent: user='%s' (%s), chat_id=%s, chat_type=%s, text='%s'",
+            user_name,
+            user_id,
+            chat_id,
+            chat_type,
+            text[:60],
+        )
+
         # Attach media path/URL when the event model supports it
         if media_url:
             if hasattr(event, "media_urls"):
@@ -1644,6 +1662,7 @@ class ZaloAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Empty message after formatting")
 
         chunks = self._split_chunks(prepared)
+        logger.info("Zalo: sending reply to chat_id=%s (%d chunk(s)): %s", chat_id, len(chunks), prepared[:50])
 
         last_result = None
         for chunk in chunks:
@@ -1652,6 +1671,7 @@ class ZaloAdapter(BasePlatformAdapter):
                 last_result = result
                 await asyncio.sleep(0.3)
             except Exception as e:
+                logger.error("Zalo: failed sending chunk to %s: %s", chat_id, e)
                 return SendResult(success=False, error=str(e))
 
         if last_result and last_result.get("ok"):
