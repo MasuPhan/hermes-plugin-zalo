@@ -54,3 +54,11 @@ optional_env:
     description: "Directory for per-group settings (default: ~/.hermes/zalo-settings)"
     prompt: "Settings directory"
     password: false
+  - name: ZALO_PAIRING_FILE
+    description: "Path for persistent pairing approvals JSON (default: ~/.hermes/zalo-pairing.json)"
+    prompt: "Pairing store file"
+    password: false
+  - name: ZALO_MEDIA_DIR
+    description: "Directory for downloaded inbound media (default: ~/.hermes/zalo-media)"
+    prompt: "Media download directory"
+    password: false

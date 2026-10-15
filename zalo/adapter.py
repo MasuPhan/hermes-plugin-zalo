@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +81,15 @@ HISTORY_DIR = os.environ.get(
     "ZALO_HISTORY_DIR",
     str(get_hermes_home() / "zalo-history"),
 )
+PAIRING_FILE = os.environ.get(
+    "ZALO_PAIRING_FILE",
+    str(get_hermes_home() / "zalo-pairing.json"),
+)
+MEDIA_DIR = os.environ.get(
+    "ZALO_MEDIA_DIR",
+    str(get_hermes_home() / "zalo-media"),
+)
+MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10MB cap
 
 # Chat/group IDs come from the wire; restrict them before they are used to
 # build local file paths (defence against traversal / odd filenames).
@@ -666,6 +676,101 @@ class _CRMContacts:
 
 
 # ---------------------------------------------------------------------------
+# Pairing Store (persistent approvals)
+# ---------------------------------------------------------------------------
+
+
+class _PairingStore:
+    """Persistent pairing approval store (JSON file, atomic write)."""
+
+    def __init__(self, filepath: str = PAIRING_FILE):
+        self._filepath = Path(filepath)
+        self._approvals: Dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self._filepath.exists():
+            self._approvals = {}
+            return
+        try:
+            with open(self._filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._approvals = data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            self._approvals = {}
+
+    def _save(self) -> None:
+        """Atomic write: write temp file then rename."""
+        try:
+            self._filepath.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._filepath.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._approvals, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._filepath)
+        except OSError as e:
+            logger.warning("Zalo: failed to save pairing store (%s)", e)
+
+    def is_approved(self, chat_id: str) -> bool:
+        entry = self._approvals.get(chat_id)
+        return bool(entry and entry.get("approved"))
+
+    def mark_approved(self, chat_id: str, user_id: str = "", user_name: str = "") -> None:
+        entry = self._approvals.get(chat_id) or {}
+        entry["approved"] = True
+        entry["user_id"] = user_id or entry.get("user_id", "")
+        entry["user_name"] = user_name or entry.get("user_name", "")
+        entry["approved_at"] = time.time()
+        entry.pop("code", None)
+        self._approvals[chat_id] = entry
+        self._save()
+
+    def get_pending(self, chat_id: str) -> Optional[dict]:
+        entry = self._approvals.get(chat_id)
+        if entry and not entry.get("approved"):
+            return entry
+        return None
+
+    def set_pending(
+        self, chat_id: str, code: str, user_id: str, user_name: str, ttl: int = 3600
+    ) -> None:
+        self._approvals[chat_id] = {
+            "code": code,
+            "user_id": user_id,
+            "user_name": user_name,
+            "expires_at": time.time() + ttl,
+            "approved": False,
+        }
+        self._save()
+
+    def get(self, chat_id: str) -> Optional[dict]:
+        return self._approvals.get(chat_id)
+
+    def set(self, chat_id: str, data: dict) -> None:
+        self._approvals[chat_id] = data
+        self._save()
+
+    def pop(self, chat_id: str) -> Optional[dict]:
+        res = self._approvals.pop(chat_id, None)
+        if res is not None:
+            self._save()
+        return res
+
+    def prune_expired(self) -> None:
+        """Remove expired unapproved challenge codes."""
+        now = time.time()
+        changed = False
+        for chat_id in list(self._approvals.keys()):
+            entry = self._approvals[chat_id]
+            if not entry.get("approved"):
+                exp = entry.get("expires_at", 0)
+                if exp and exp < now:
+                    del self._approvals[chat_id]
+                    changed = True
+        if changed:
+            self._save()
+
+
+# ---------------------------------------------------------------------------
 # Zalo Adapter
 # ---------------------------------------------------------------------------
 
@@ -719,8 +824,7 @@ class ZaloAdapter(BasePlatformAdapter):
         self._bot_id: str = ""
         self._bot_name: str = ""
         self._bot_display_name: str = ""
-        self._pending_approvals: Dict[str, dict] = {}  # chat_id -> captcha info
-        self._captcha_passed: set = set()  # chat_ids that solved the captcha
+        self._pairing_store = _PairingStore()
 
         # Moderation & group management instances. _GroupManager resolves
         # self._client lazily (client is only created in connect()).
@@ -759,6 +863,7 @@ class ZaloAdapter(BasePlatformAdapter):
             return False
 
         self._client = _ZaloClient(self.bot_token)
+        self._pairing_store.prune_expired()
 
         # Verify token
         try:
@@ -1065,46 +1170,35 @@ class ZaloAdapter(BasePlatformAdapter):
 
         # ── DM handling ─────────────────────────────────────────────────
         # DM pairing approval flow (only for PRIVATE chats).
-        # The real approval is Hermes core pairing (`hermes pairing approve
-        # zalo <code>`). The adapter code below is only a self-served captcha:
-        # it proves the requester can read the chat and cuts drive-by spam,
-        # it never grants access on its own.
-        if self.dm_policy == "pairing" and chat_id not in self._captcha_passed:
-            if chat_id not in self._pending_approvals:
+        # The pairing store persists approved chats across gateway restarts.
+        if self.dm_policy == "pairing" and not self._pairing_store.is_approved(chat_id):
+            pending = self._pairing_store.get_pending(chat_id)
+            if not pending:
                 # First contact — generate a random captcha code
                 code = f"{secrets.randbelow(10**6):06d}"
-                self._pending_approvals[chat_id] = {
-                    "code": code,
-                    "user_id": user_id,
-                    "user_name": user_name,
-                    "expires_at": time.time() + 3600,  # 1 hour
-                }
+                self._pairing_store.set_pending(chat_id, code, user_id, user_name, ttl=3600)
                 # Send captcha code
                 await self._send_captcha_code(chat_id, code, user_name)
                 return
 
             # Check if the message is the captcha code
-            approval = self._pending_approvals[chat_id]
             text = (message.get("text") or "").strip()
-            if approval.get("expires_at", 0) < time.time():
-                self._pending_approvals.pop(chat_id, None)
-                self._captcha_passed.discard(chat_id)
+            if pending.get("expires_at", 0) < time.time():
+                self._pairing_store.pop(chat_id)
                 await self._send_text(chat_id, "⚠️ Mã xác thực đã hết hạn. Gửi tin nhắn bất kỳ để nhận mã mới.")
                 return
-            if text == approval["code"]:
-                # Captcha passed — mark and fall through to handle the message
-                self._captcha_passed.add(chat_id)
-                self._pending_approvals.pop(chat_id, None)
+            if text == pending["code"]:
+                # Captcha passed — mark approved and fall through to handle the message
+                self._pairing_store.mark_approved(chat_id, user_id, user_name)
                 await self._send_text(chat_id, "✅ Xác thực thành công! Bạn có thể trò chuyện với bot.")
             else:
-                if approval.get("expires_at", 0) < time.time():
-                    self._pending_approvals.pop(chat_id, None)
-                    self._captcha_passed.discard(chat_id)
+                if pending.get("expires_at", 0) < time.time():
+                    self._pairing_store.pop(chat_id)
                     await self._send_text(chat_id, "⚠️ Mã xác thực đã hết hạn. Gửi tin nhắn bất kỳ để nhận mã mới.")
                     return
                 await self._send_text(
                     chat_id,
-                    f"⚠️ Vui lòng nhập mã xác thực **{approval['code']}** để bắt đầu trò chuyện."
+                    f"⚠️ Vui lòng nhập mã xác thực **{pending['code']}** để bắt đầu trò chuyện."
                 )
                 return
 
@@ -1405,6 +1499,40 @@ class ZaloAdapter(BasePlatformAdapter):
             return True
         return self._is_user_authorized(user_id)
 
+    async def _download_media(self, url: str) -> Optional[str]:
+        """Download media from Zalo CDN to a local temp file.
+
+        Zalo CDN URLs are auth-restricted and expire, so we must download
+        immediately. Returns local file path, or None on failure.
+        """
+        if not self._client or not self._client._client:
+            return None
+        try:
+            resp = await self._client._client.get(url)
+            resp.raise_for_status()
+            content = resp.content
+            if not content:
+                return None
+
+            # Detect extension from Content-Type
+            ext = ".jpg"
+            ct = resp.headers.get("Content-Type", "")
+            if "png" in ct:
+                ext = ".png"
+            elif "gif" in ct:
+                ext = ".gif"
+            elif "webp" in ct:
+                ext = ".webp"
+
+            os.makedirs(MEDIA_DIR, exist_ok=True)
+            fd, path = tempfile.mkstemp(prefix="zalo_media_", suffix=ext, dir=MEDIA_DIR)
+            with os.fdopen(fd, "wb") as f:
+                f.write(content[:MAX_MEDIA_BYTES])
+            return path
+        except Exception as e:
+            logger.warning("Zalo: media download failed (%s) — passing URL as fallback", e)
+            return None
+
     async def _dispatch_message(
         self,
         text: str,
@@ -1418,6 +1546,12 @@ class ZaloAdapter(BasePlatformAdapter):
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
             return
+
+        # Download image media immediately (Zalo CDN URLs expire)
+        if message_type == MessageType.IMAGE and media_url:
+            media_path = await self._download_media(media_url)
+            if media_path:
+                media_url = media_path
 
         source = self.build_source(
             chat_id=chat_id,
@@ -1434,6 +1568,15 @@ class ZaloAdapter(BasePlatformAdapter):
             message_id=str(int(time.time() * 1000)),
             timestamp=datetime.now(),
         )
+
+        # Attach media path/URL when the event model supports it
+        if media_url:
+            if hasattr(event, "media_urls"):
+                event.media_urls = [media_url]
+            elif hasattr(event, "media_url"):
+                setattr(event, "media_url", media_url)
+            elif hasattr(event, "media_path"):
+                setattr(event, "media_path", media_url)
 
         await self.handle_message(event)
 
