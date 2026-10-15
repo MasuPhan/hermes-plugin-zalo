@@ -724,6 +724,29 @@ class _PairingStore:
         self._approvals[chat_id] = entry
         self._save()
 
+        # Mirror to Hermes Core platform pairing store so core gateway admits user
+        uid = user_id or entry.get("user_id", "")
+        if uid:
+            try:
+                core_pairing_file = get_hermes_home() / "platforms" / "pairing" / "zalo-approved.json"
+                core_pairing_file.parent.mkdir(parents=True, exist_ok=True)
+                core_data = {}
+                if core_pairing_file.exists():
+                    with open(core_pairing_file, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                        if isinstance(loaded, dict):
+                            core_data = loaded
+                core_data[uid] = {
+                    "user_name": user_name or entry.get("user_name", ""),
+                    "approved_at": time.time(),
+                }
+                tmp = core_pairing_file.with_suffix(".json.tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(core_data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, core_pairing_file)
+            except Exception as e:
+                logger.warning("Zalo: failed to mirror approval to core pairing store (%s)", e)
+
     def get_pending(self, chat_id: str) -> Optional[dict]:
         entry = self._approvals.get(chat_id)
         if entry and not entry.get("approved"):
